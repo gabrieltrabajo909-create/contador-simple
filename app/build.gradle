@@ -1,0 +1,29 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Cada armado en GitHub lleva un número más alto, para que el teléfono sepa
+// que es una versión nueva.
+def numero = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+
+android {
+    namespace 'app.feeltheone.simple'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'app.feeltheone.simple'
+        minSdk 24
+        targetSdk 34
+        versionCode numero
+        versionName "1.${numero}"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.11.0'
+}

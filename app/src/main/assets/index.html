@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0d12">
+<title>Contador simple</title>
+<link rel="icon" href="icono-64.png">
+<style>
+  :root {
+    --fondo: #0e0d12; --texto: #f2eef8; --suave: #8e88a0; --linea: #2a2733;
+    --uno: #ff5a7a; --tiempo: #ffd36e; --punto: #3a3645;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--fondo); color: var(--texto);
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 24px 16px; gap: 28px; text-align: center;
+    -webkit-tap-highlight-color: transparent; user-select: none;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; color: var(--suave); letter-spacing: .02em; }
+  #numero {
+    font-size: min(52vw, 300px); font-weight: 800; line-height: 1;
+    font-variant-numeric: tabular-nums; color: var(--punto);
+    transition: transform .08s ease-out;
+  }
+  #numero.vivo { color: var(--tiempo); }
+  #numero.uno { color: var(--uno); }
+  #numero.golpe { transform: scale(1.08); }
+  #puntos { display: flex; gap: 10px; }
+  #puntos span {
+    width: 22px; height: 22px; border-radius: 50%; background: var(--punto);
+    display: grid; place-items: center; font-size: 11px; color: var(--fondo); font-weight: 700;
+  }
+  #puntos span.on { background: var(--tiempo); }
+  #puntos span.on.uno { background: var(--uno); }
+  #estado { color: var(--suave); min-height: 1.4em; font-size: 16px; max-width: 360px; }
+  button {
+    font: inherit; font-size: 18px; font-weight: 600; border: 0; border-radius: 999px;
+    padding: 16px 32px; cursor: pointer;
+  }
+  #empezar { background: var(--uno); color: #fff; }
+  #corregir { background: transparent; color: var(--texto); border: 1px solid var(--linea); font-size: 15px; padding: 12px 22px; }
+  .oculto { display: none !important; }
+  #ayuda { color: var(--suave); font-size: 13px; max-width: 340px; line-height: 1.45; margin: 0; }
+</style>
+</head>
+<body>
+  <h1>Contador simple</h1>
+  <div id="numero">–</div>
+  <div id="puntos"></div>
+  <div id="estado">Poné la música y tocá Empezar.</div>
+  <button id="empezar">Empezar</button>
+  <button id="corregir" class="oculto">Tocá aquí justo en el UNO</button>
+  <p id="ayuda" class="oculto">Cuenta sola. Si el UNO no cae donde va, tocá el botón en el UNO una vez y se acomoda.</p>
+
+<!-- ======================================================================
+     El motor. Nada aquí toca la pantalla, para poder probarlo suelto
+     (tests/simple.test.mjs lee este bloque tal cual).
+     ====================================================================== -->
+<script id="motor">
+/* Cómo cuenta solo, en tres pasos:
+
+   1. LA VELOCIDAD. Cada décima de segundo se mide cuánto sonido NUEVO entró
+      (un golpe de güira, de bongó, de bajo). Eso da una línea de picos. Si la
+      línea se parece a sí misma corrida medio segundo, el tiempo dura medio
+      segundo. Se prueban todos los corrimientos posibles y gana el que más se
+      parece.
+
+   2. DÓNDE CAE CADA TIEMPO. Ya sabiendo cuánto dura, se busca la rejilla de
+      tiempos que más picos pisa.
+
+   3. CUÁL ES EL UNO. Lo más difícil. Se mira en qué tiempo entra fuerte el
+      bajo y en cuál cambia el acorde: los dos suelen caer en el UNO. Se va
+      sumando a lo largo de la canción y gana el que más acumula. Puede
+      equivocarse entre el 1 y el 5 (suenan muy parecido); para eso está el
+      botón de corregir. */
+
+const AJ = {
+  FPS: 100,            // mediciones por segundo
+  VENTANA: 8,          // segundos que se miran para la velocidad
+  BPM_MIN: 85,
+  BPM_MAX: 210,
+  /* Las canciones de baile casi siempre van cerca de esto. Sirve para
+     desempatar entre "130" y su mitad "65" o su doble "260", que para la
+     cuenta matemática son casi lo mismo. */
+  BPM_CENTRO: 128,
+  BPM_ANCHO: 0.7,      // en octavas
+  FASE: 4,             // segundos que se miran para colocar la rejilla
+  UNO_VENTANA: 16,     // segundos que se miran para decidir el UNO
+  CAPACIDAD: 2048,     // mediciones guardadas (unos 20 s)
+  PORCOMPAS: 8,
+  /* Desde qué claridad de ritmo se muestra la cuenta. Ruido o charla dan
+     alrededor de 1,3; una bachata de prueba, más de 10. */
+  CLARIDAD: 1.6
+};
+
+/* Lo que se mide del sonido. Corre dentro del hilo de audio, así que no puede
+   usar nada de fuera: todo lo que necesita está aquí dentro. */
+class Rasgos {
+  constructor(rate, salida) {
+    this.rate = rate;
+    this.N = rate >= 32000 ? 2048 : 1024;
+    this.hop = rate / 100;             // fraccionario a propósito: 100 por segundo exactos
+    this.salida = salida;
+    this.buf = new Float32Array(this.N);
+    this.escrito = 0;                  // muestras recibidas en total
+    this.siguiente = this.N;           // cuándo toca la próxima medición
+    this.re = new Float32Array(this.N);
+    this.im = new Float32Array(this.N);
+    this.prev = new Float32Array(this.N / 2);
+    this.hayPrev = false;
+    this.hann = new Float32Array(this.N);
+    for (let i = 0; i < this.N; i++) this.hann[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / this.N);
+    const hz = rate / this.N;
+    this.kMin = Math.max(1, Math.round(30 / hz));
+    this.kGrave = Math.round(150 / hz);
+    this.kMax = Math.min(this.N / 2 - 1, Math.round(8000 / hz));
+    // A qué nota pertenece cada casilla, para saber qué acorde suena
+    this.nota = new Int8Array(this.N / 2).fill(-1);
+    for (let k = 1; k < this.N / 2; k++) {
+      const f = k * hz;
+      if (f >= 110 && f <= 2000) this.nota[k] = ((Math.round(12 * Math.log2(f / 440)) % 12) + 12) % 12;
+    }
+    this.cuenta = 0;
+  }
+
+  meter(muestras) {
+    const N = this.N;
+    for (let j = 0; j < muestras.length; j++) {
+      this.buf[this.escrito % N] = muestras[j];
+      this.escrito++;
+      if (this.escrito >= this.siguiente) {
+        this.medir();
+        this.siguiente += this.hop;
+      }
+    }
+  }
+
+  medir() {
+    const N = this.N, re = this.re, im = this.im;
+    const ini = this.escrito; // la más vieja está en escrito % N
+    for (let i = 0; i < N; i++) { re[i] = this.buf[(ini + i) % N] * this.hann[i]; im[i] = 0; }
+    Rasgos.fft(re, im);
+    let flujo = 0, grave = 0;
+    const croma = new Float32Array(12);
+    const esc = 4 / N;
+    for (let k = this.kMin; k <= this.kMax; k++) {
+      const m = Math.sqrt(re[k] * re[k] + im[k] * im[k]) * esc;
+      const l = Math.log1p(100 * m);
+      if (this.hayPrev) {
+        const d = l - this.prev[k];
+        if (d > 0) { flujo += d; if (k <= this.kGrave) grave += d; }
+      }
+      this.prev[k] = l;
+      if (this.nota[k] >= 0) croma[this.nota[k]] += l;
+    }
+    this.hayPrev = true;
+    this.salida(this.cuenta++, flujo, grave, croma);
+  }
+
+  static fft(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let cr = 1, ci = 0;
+        for (let k = 0; k < len / 2; k++) {
+          const a = i + k, b = a + len / 2;
+          const xr = re[b] * cr - im[b] * ci, xi = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - xr; im[b] = im[a] - xi;
+          re[a] += xr; im[a] += xi;
+          const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+        }
+      }
+    }
+  }
+}
+
+/* El que cuenta. Recibe las mediciones de una en una y dice qué número va. */
+class Contador {
+  constructor() {
+    const C = AJ.CAPACIDAD;
+    this.flujo = new Float32Array(C);
+    this.grave = new Float32Array(C);
+    this.croma = new Float32Array(C * 12);
+    this.n = 0;               // mediciones recibidas
+    this.P = 0;               // duración de un tiempo, en mediciones
+    this.ref = 0;             // una medición donde cae un tiempo
+    this.nRef = 0;            // qué número de tiempo es ese (contando desde que empezó)
+    this.dudaP = 0; this.candP = 0;
+    this.dudaF = 0;
+    this.unoVotos = new Float32Array(AJ.PORCOMPAS);
+    this.uno = 0;             // tiempos cuyo número % 8 da esto son el UNO
+    this.confianza = 0;
+  }
+
+  push(i, flujo, grave, croma) {
+    const C = AJ.CAPACIDAD, p = i % C;
+    this.flujo[p] = flujo; this.grave[p] = grave;
+    this.croma.set(croma, p * 12);
+    this.n = i + 1;
+    if (this.n % 50 === 0) this.pensar();
+  }
+
+  /* La línea de golpes de los últimos "seg" segundos, sin el nivel de fondo:
+     solo lo que sobresale de lo que suena alrededor. */
+  golpes(seg) {
+    const W = Math.min(this.n, Math.round(seg * AJ.FPS), AJ.CAPACIDAD);
+    const ini = this.n - W, C = AJ.CAPACIDAD, R = 10;
+    const crudo = new Float32Array(W), o = new Float32Array(W);
+    for (let i = 0; i < W; i++) crudo[i] = this.flujo[(ini + i) % C];
+    let suma = 0;
+    for (let i = 0; i < Math.min(W, R); i++) suma += crudo[i];
+    for (let i = 0; i < W; i++) {
+      const a = i - R - 1, b = i + R;
+      if (b < W) suma += crudo[b];
+      if (a >= 0) suma -= crudo[a];
+      const ancho = Math.min(W - 1, b) - Math.max(0, a + 1) + 1;
+      const d = crudo[i] - suma / ancho;
+      o[i] = d > 0 ? d : 0;
+    }
+    return { o, ini };
+  }
+
+  pensar() {
+    if (this.n < 4 * AJ.FPS) return;
+    const { o, ini } = this.golpes(AJ.VENTANA);
+    const W = o.length;
+
+    // ¿Hay música? Si apenas entra sonido nuevo, no se inventa nada.
+    let energia = 0;
+    for (let i = W - 3 * AJ.FPS; i < W; i++) energia += o[i];
+    if (energia / (3 * AJ.FPS) < 0.05) { this.confianza = 0; return; }
+
+    // 1. La velocidad
+    const Lmin = Math.floor(AJ.FPS * 60 / AJ.BPM_MAX);
+    const Lmax = Math.ceil(AJ.FPS * 60 / AJ.BPM_MIN);
+    const ac = new Float32Array(2 * Lmax + 2);
+    for (let L = 1; L < ac.length && L < W / 2; L++) {
+      let s = 0;
+      for (let i = L; i < W; i++) s += o[i] * o[i - L];
+      ac[L] = s / (W - L);
+    }
+    const nota = new Float32Array(Lmax + 2);
+    let mejor = 0, suma = 0, cuantos = 0, maxAc = 0;
+    for (let L = Lmin; L <= Lmax; L++) {
+      if (ac[L] > maxAc) maxAc = ac[L];
+      const bpm = 60 * AJ.FPS / L;
+      const prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / AJ.BPM_CENTRO) / AJ.BPM_ANCHO, 2));
+      nota[L] = (ac[L] + 0.5 * (ac[2 * L] || 0)) * prior;
+      suma += ac[L]; cuantos++;
+      if (nota[L] > nota[mejor]) mejor = L;
+    }
+    if (!mejor || nota[mejor] <= 0) { this.confianza = 0; return; }
+    /* Qué tanto se repite la música: el mejor parecido contra el parecido
+       medio. Con ruido o con charla todos los corrimientos se parecen igual
+       y esto queda cerca de 1; con un ritmo claro sube mucho. */
+    this.confianza = maxAc / (suma / cuantos);
+    // Afinar entre casillas
+    let Pn = mejor;
+    if (mejor > Lmin && mejor < Lmax) {
+      const a = nota[mejor - 1], b = nota[mejor], c = nota[mejor + 1];
+      const den = a - 2 * b + c;
+      if (den < 0) Pn = mejor + 0.5 * (a - c) / den;
+    }
+
+    if (!this.P) this.P = Pn;
+    else if (Math.abs(Pn / this.P - 1) < 0.04) { this.P = 0.8 * this.P + 0.2 * Pn; this.dudaP = 0; }
+    else {
+      // Un cambio grande solo se cree si se repite
+      if (this.dudaP && Math.abs(Pn / this.candP - 1) < 0.04) this.dudaP++;
+      else { this.dudaP = 1; this.candP = Pn; }
+      if (this.dudaP >= 3) { this.P = Pn; this.dudaP = 0; }
+    }
+    const P = this.P;
+
+    // 2. Dónde cae cada tiempo
+    const F = Math.min(W, Math.round(AJ.FASE * AJ.FPS));
+    const pasos = Math.ceil(P);
+    const fase = new Float32Array(pasos);
+    for (let f = 0; f < pasos; f++) {
+      let s = 0, peso = 1;
+      for (let x = W - 1 - f; x >= W - F; x -= P, peso *= 0.9) {
+        const c = Math.round(x);
+        let m = 0;
+        for (let d = -2; d <= 2; d++) { const v = o[c + d] || 0; if (v > m) m = v; }
+        s += m * peso;
+      }
+      fase[f] = s;
+    }
+    let fm = 0;
+    for (let f = 1; f < pasos; f++) if (fase[f] > fase[fm]) fm = f;
+    const refN = ini + W - 1 - fm;      // un tiempo, en número de medición
+
+    if (!this.ref && !this.nRef) { this.ref = refN; this.nRef = 0; }
+    else {
+      const k = Math.round((refN - this.ref) / P);
+      const previsto = this.ref + k * P;
+      const d = refN - previsto;
+      if (Math.abs(d) < 0.2 * P) {
+        this.ref = previsto + 0.5 * d; this.nRef += k; this.dudaF = 0;
+      } else if (++this.dudaF >= 2) {
+        // La rejilla estaba corrida: se salta a la nueva sin perder la numeración
+        this.ref = refN; this.nRef += k; this.dudaF = 0;
+      } else {
+        this.ref = previsto; this.nRef += k;
+      }
+    }
+
+    // 3. Cuál es el UNO
+    this.votarUno();
+  }
+
+  /* El número de tiempo (desde que empezó) de un instante dado, en mediciones. */
+  tiempoDe(i) { return this.nRef + Math.floor((i - this.ref) / this.P + 1e-6); }
+
+  votarUno() {
+    const P = this.P, C = AJ.CAPACIDAD;
+    const desde = Math.max(0, this.n - Math.min(AJ.UNO_VENTANA * AJ.FPS, C - 1));
+    const hasta = this.n - Math.ceil(P) - 3;
+    const n0 = this.tiempoDe(desde) + 1, n1 = this.tiempoDe(hasta);
+    if (n1 - n0 < 8) return;
+    const grave = [], cambio = [];
+    let prev = null;
+    for (let b = n0; b <= n1; b++) {
+      const c = Math.round(this.ref + (b - this.nRef) * P);
+      let g = 0;
+      for (let d = -3; d <= 3; d++) { const v = this.grave[(((c + d) % C) + C) % C]; if (v > g) g = v; }
+      const cr = new Float32Array(12);
+      for (let x = c; x < c + P; x++) for (let q = 0; q < 12; q++) cr[q] += this.croma[(((x % C) + C) % C) * 12 + q];
+      let h = 0;
+      if (prev) {
+        let pp = 0, aa = 0, pa = 0;
+        for (let q = 0; q < 12; q++) { pp += prev[q] * prev[q]; aa += cr[q] * cr[q]; pa += prev[q] * cr[q]; }
+        h = 1 - pa / (Math.sqrt(pp * aa) || 1);
+      }
+      grave.push(g); cambio.push(h);
+      prev = cr;
+    }
+    const media = a => a.reduce((s, v) => s + v, 0) / a.length || 1;
+    const mg = media(grave), mc = media(cambio.slice(1));
+    const voto = new Float32Array(AJ.PORCOMPAS);
+    for (let j = 0; j < grave.length; j++) {
+      const pos = (((n0 + j) % AJ.PORCOMPAS) + AJ.PORCOMPAS) % AJ.PORCOMPAS;
+      voto[pos] += grave[j] / mg + (j ? cambio[j] / mc : 0);
+    }
+    /* El UNO y el CINCO se parecen mucho. Primero se decide cuál de las cuatro
+       parejas (1-5, 2-6, 3-7, 4-8) es la buena, y luego, dentro de la pareja,
+       cuál va primero. Así un error queda en "1 por 5", que se baila igual,
+       y no en "1 por 3". */
+    for (let q = 0; q < AJ.PORCOMPAS; q++) this.unoVotos[q] = 0.85 * this.unoVotos[q] + voto[q];
+    const V = this.unoVotos;
+    let par = 0;
+    for (let q = 1; q < 4; q++) if (V[q] + V[q + 4] > V[par] + V[par + 4]) par = q;
+    let nuevo = V[par] >= V[par + 4] ? par : par + 4;
+    const actual = this.uno;
+    if (nuevo !== actual) {
+      // Cambiar el UNO a mitad de canción desconcierta: solo con ventaja clara
+      const pa = actual % 4;
+      const sAct = V[pa] + V[pa + 4], sNue = V[par] + V[par + 4];
+      if (par !== pa && sNue < 1.15 * sAct) nuevo = actual;
+      if (par === pa && V[nuevo] < 1.15 * V[actual]) nuevo = actual;
+    }
+    this.uno = nuevo;
+  }
+
+  /* El que escucha dice "esto es el UNO". */
+  marcarUno(i) {
+    if (!this.P) return false;
+    const b = this.nRef + Math.round((i - this.ref) / this.P);
+    const q = ((b % AJ.PORCOMPAS) + AJ.PORCOMPAS) % AJ.PORCOMPAS;
+    let max = 0;
+    for (const v of this.unoVotos) if (v > max) max = v;
+    // Mucho peso, pero no infinito: si la canción insiste en otra cosa, con el tiempo se oye
+    this.unoVotos[q] = 3 * (max || 1);
+    this.uno = q;
+    return true;
+  }
+
+  /* Qué mostrar en el instante i (en mediciones, puede llevar decimales). */
+  estado(i) {
+    if (!this.P || this.confianza < AJ.CLARIDAD) return { listo: false };
+    const b = this.tiempoDe(i);
+    const cuenta = ((((b - this.uno) % AJ.PORCOMPAS) + AJ.PORCOMPAS) % AJ.PORCOMPAS) + 1;
+    return { listo: true, cuenta, tiempo: b, bpm: Math.round(60 * AJ.FPS / this.P) };
+  }
+}
+</script>
+
+<!-- ======================================================================
+     La pantalla y el micrófono
+     ====================================================================== -->
+<script>
+const $ = id => document.getElementById(id);
+const puntos = $("puntos");
+for (let q = 1; q <= 8; q++) {
+  const s = document.createElement("span");
+  s.textContent = q;
+  if (q === 1) s.classList.add("uno");
+  puntos.appendChild(s);
+}
+
+/* El sonido tarda un poco en llegar del parlante al micrófono y de ahí a la
+   pantalla. Se adelanta la cuenta esto para que el número caiga con el golpe. */
+const ADELANTO = 0.06;
+
+let ctx = null, contador = null, inicio = null, bloqueo = null, ultimo = -1;
+
+/* El código que corre en el hilo de audio. Se arma con la misma clase Rasgos
+   que está arriba, para que no haya dos copias que puedan quedar distintas. */
+const OBRERO = `
+const AJ = ${JSON.stringify(AJ)};
+${Rasgos.toString()}
+class Oido extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.r = new Rasgos(sampleRate, (i, flujo, grave, croma) => {
+      if (i === 0) this.port.postMessage({ inicio: currentTime });
+      this.port.postMessage({ i, flujo, grave, croma }, [croma.buffer]);
+    });
+  }
+  process(entradas) {
+    const c = entradas[0] && entradas[0][0];
+    if (c) this.r.meter(c);
+    return true;
+  }
+}
+registerProcessor("oido", Oido);
+`;
+
+async function empezar() {
+  $("empezar").disabled = true;
+  $("estado").textContent = "Pidiendo el micrófono…";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    ctx = new Audio();
+    if (ctx.state === "suspended") await ctx.resume();
+    const url = URL.createObjectURL(new Blob([OBRERO], { type: "application/javascript" }));
+    await ctx.audioWorklet.addModule(url);
+    const fuente = ctx.createMediaStreamSource(stream);
+    const oido = new AudioWorkletNode(ctx, "oido", { numberOfInputs: 1, numberOfOutputs: 0 });
+    contador = new Contador();
+    oido.port.onmessage = e => {
+      const m = e.data;
+      /* La primera medición se toma cuando ya hay una ventana entera de
+         sonido; su centro cae media ventana antes. */
+      if (m.inicio !== undefined) { inicio = m.inicio; return; }
+      contador.push(m.i, m.flujo, m.grave, m.croma);
+    };
+    fuente.connect(oido);
+    $("empezar").classList.add("oculto");
+    $("corregir").classList.remove("oculto");
+    $("ayuda").classList.remove("oculto");
+    $("estado").textContent = "Escuchando… en unos segundos empieza a contar.";
+    mantenerPantalla();
+    requestAnimationFrame(dibujar);
+  } catch (e) {
+    $("empezar").disabled = false;
+    $("estado").textContent = e && e.name === "NotAllowedError"
+      ? "Hace falta permitir el micrófono para que pueda escuchar."
+      : "No pude abrir el micrófono: " + (e && e.message || e);
+  }
+}
+
+function medicionAhora() {
+  if (inicio === null) return -1;
+  return (ctx.currentTime + ADELANTO - inicio) * AJ.FPS;
+}
+
+function dibujar() {
+  requestAnimationFrame(dibujar);
+  const s = contador.estado(medicionAhora());
+  const num = $("numero");
+  if (!s.listo) {
+    num.textContent = "–";
+    num.className = "";
+    for (const p of puntos.children) p.classList.remove("on");
+    if (contador.n > 4 * AJ.FPS) $("estado").textContent = "Esperando música clara…";
+    ultimo = -1;
+    return;
+  }
+  if (s.tiempo !== ultimo) {
+    ultimo = s.tiempo;
+    num.textContent = s.cuenta;
+    num.className = "vivo golpe" + (s.cuenta === 1 ? " uno" : "");
+    setTimeout(() => num.classList.remove("golpe"), 90);
+    [...puntos.children].forEach((p, q) => p.classList.toggle("on", q < s.cuenta));
+    $("estado").textContent = s.bpm + " BPM";
+  }
+}
+
+function corregir() {
+  if (!contador || !contador.marcarUno(medicionAhora())) return;
+  $("estado").textContent = "Listo, el UNO va ahí.";
+}
+
+/* Que la pantalla no se apague mientras se baila */
+async function mantenerPantalla() {
+  try { bloqueo = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && ctx) mantenerPantalla();
+});
+
+$("empezar").addEventListener("click", empezar);
+$("corregir").addEventListener("pointerdown", corregir);
+</script>
+</body>
+</html>
